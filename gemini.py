@@ -1,9 +1,9 @@
 import alpaca_trade_api as tradeapi
 import pandas as pd
-import pandas_ta as ta # For technical indicators
-from datetime import datetime, timedelta, date # Added date for YESTERDAY
+import pandas_ta as ta
+from datetime import datetime, timedelta, date
 import os
-import pytz # For timezone handling
+import pytz
 import matplotlib.pyplot as plt
 from dotenv import load_dotenv
 
@@ -21,18 +21,20 @@ BASE_URL = os.getenv('ALPACA_BASE_URL', 'https://paper-api.alpaca.markets') # Us
 SYMBOL = 'XRP/USD'
 TIMEFRAME = tradeapi.TimeFrame.Day
 
-# --- MODIFIED PARAMETERS FOR EXPERIMENTATION ---
-START_DATE_STR = '2024-01-01' # Focused on the period with known data
+START_DATE_STR = '2024-01-01'
 YESTERDAY = (date.today() - timedelta(days=1)).strftime('%Y-%m-%d')
-END_DATE_STR = YESTERDAY # Set to yesterday to avoid future data issues
+END_DATE_STR = YESTERDAY
 
 # Strategy Parameters
 BB_LENGTH = 20
 BB_STD_DEV = 2.0
 RSI_LENGTH = 14
 RSI_OVERBOUGHT = 65
-RSI_OVERSOLD = 35 # <<<< Experiment 1: Relaxed from 30 to 35
-VWAP_STOP_PERCENTAGE_BUFFER = 0.02 # <<<< Experiment 2: 1% buffer (0.01 means price must be 1% below VWAP)
+RSI_OVERSOLD = 35
+# VWAP_STOP_PERCENTAGE_BUFFER = 0.02 # <<< REMOVED, will use ATR stop
+
+ATR_PERIOD = 14 # <<< NEW: ATR Period
+ATR_STOP_MULTIPLIER = 2.25 # <<< NEW: ATR Stop Multiplier
 
 INITIAL_CAPITAL = 10000.00
 POSITION_SIZE_USD = 1000.00
@@ -48,32 +50,23 @@ except Exception as e:
 
 # --- 1. Fetch Historical Data ---
 def get_historical_data(symbol, timeframe, start_str, end_str):
+    # (Same as your last version)
     print(f"Fetching data for {symbol} from {start_str} to {end_str} with timeframe {timeframe.value}")
     try:
-        utc = pytz.UTC
-        start_dt = utc.localize(datetime.strptime(start_str, '%Y-%m-%d'))
+        utc = pytz.UTC; start_dt = utc.localize(datetime.strptime(start_str, '%Y-%m-%d'))
         end_dt_inclusive = utc.localize(datetime.strptime(end_str, '%Y-%m-%d'))
         end_dt_exclusive = end_dt_inclusive + timedelta(days=1)
-
         bars = api.get_crypto_bars(symbol, timeframe, start=start_dt.isoformat(), end=end_dt_exclusive.isoformat()).df
-        
-        if bars.empty:
-            print("No data fetched from Alpaca.")
-            return pd.DataFrame()
-
+        if bars.empty: print("No data fetched."); return pd.DataFrame()
         if not bars.index.tz: bars = bars.tz_localize('UTC')
         else: bars = bars.tz_convert('UTC')
-        
         bars = bars[bars.index <= end_dt_inclusive.replace(hour=23, minute=59, second=59)]
         required_ohlcv = ['open', 'high', 'low', 'close', 'volume']
-        if 'vwap' in bars.columns: required_ohlcv.append('vwap')
+        if 'vwap' in bars.columns: required_ohlcv.append('vwap') # Keep VWAP for potential future use or reference
         bars = bars[required_ohlcv]
-
-        print(f"Fetched {len(bars)} bars. Actual date range in data: {bars.index.min()} to {bars.index.max()}")
+        print(f"Fetched {len(bars)} bars. Actual date range: {bars.index.min()} to {bars.index.max()}")
         return bars
-    except Exception as e:
-        print(f"Error fetching historical data for {symbol}: {e}")
-        return pd.DataFrame()
+    except Exception as e: print(f"Error fetching data: {e}"); return pd.DataFrame()
 
 # --- 2. Calculate Indicators ---
 def add_indicators(df):
@@ -85,198 +78,205 @@ def add_indicators(df):
     upper_band_col = f'BBU_{BB_LENGTH}_{BB_STD_DEV}'
     df.ta.rsi(length=RSI_LENGTH, append=True)
     rsi_col = f'RSI_{RSI_LENGTH}'
-
-    if 'vwap' not in df.columns:
-        print("VWAP not in Alpaca data, calculating using pandas_ta...")
-        df.ta.vwap(append=True)
-        if 'VWAP_D' in df.columns: df.rename(columns={'VWAP_D': 'VWAP'}, inplace=True)
-        elif 'VWAP' not in df.columns and any(col.startswith('VWAP_') for col in df.columns):
-            vwap_col_pandas_ta = [col for col in df.columns if col.startswith('VWAP_')][0]
-            df.rename(columns={vwap_col_pandas_ta: 'VWAP'}, inplace=True)
-            print(f"Renamed pandas_ta VWAP column '{vwap_col_pandas_ta}' to 'VWAP'")
-    else:
+    if 'vwap' in df.columns: # Keep VWAP if provided, rename
         print("Using VWAP provided by Alpaca.")
         df.rename(columns={'vwap': 'VWAP'}, inplace=True)
+    else: # Calculate if not provided (though Alpaca crypto usually has it)
+        print("VWAP not in Alpaca data, calculating...")
+        df.ta.vwap(append=True)
+        if 'VWAP_D' in df.columns: df.rename(columns={'VWAP_D': 'VWAP'}, inplace=True)
 
-    print(f"Columns after adding indicators: {df.columns.tolist()}")
-    required_cols_for_signals = ['close', lower_band_col, upper_band_col, middle_band_col, rsi_col, 'VWAP']
-    missing_at_indicator_stage = [col for col in required_cols_for_signals if col not in df.columns]
-    if missing_at_indicator_stage:
-        print(f"ERROR: Missing critical indicator columns BEFORE dropna: {missing_at_indicator_stage}")
-    
+
+    # --- NEW: Add ATR ---
+    df.ta.atr(length=ATR_PERIOD, append=True)
+    atr_col = f'ATRr_{ATR_PERIOD}' # pandas-ta default name for ATR
+    print(f"Added {atr_col}")
+
+    print(f"Columns after adding all indicators: {df.columns.tolist()}")
+    # VWAP is no longer strictly required for the ATR stop strategy, but good to have
+    required_cols_check = ['close', lower_band_col, middle_band_col, upper_band_col, rsi_col, atr_col]
+    if 'VWAP' in df.columns: required_cols_check.append('VWAP') # Add if exists for completeness
+
+    missing_cols = [col for col in required_cols_check if col not in df.columns]
+    if missing_cols:
+        print(f"ERROR: Missing critical indicator columns BEFORE dropna: {missing_cols}")
+
     df.dropna(inplace=True)
-    print(f"Shape of data after adding indicators and dropna: {df.shape}")
-    if df.empty: print("DataFrame is empty after adding indicators and dropping NA.")
+    print(f"Shape of data after indicators & dropna: {df.shape}")
+    if df.empty: print("DataFrame empty after indicators & dropna.")
     return df
 
-# --- 3. Define Strategy & Generate Signals ---
+# --- 3. Define Strategy & Generate Signals (Profit Takes Only) ---
 def generate_signals(df):
-    print("\n--- Generating Signals ---")
+    print("\n--- Generating Signals (Profit Takes & Buys) ---")
     signals = pd.DataFrame(index=df.index)
     signals['signal'] = 0
-    signals['sell_reason'] = ''
+    signals['sell_reason'] = '' # For profit-take reasons
 
     lower_band_col = f'BBL_{BB_LENGTH}_{BB_STD_DEV}'
     upper_band_col = f'BBU_{BB_LENGTH}_{BB_STD_DEV}'
-    middle_band_col = f'BBM_{BB_LENGTH}_{BB_STD_DEV}' # For potential future use
+    middle_band_col = f'BBM_{BB_LENGTH}_{BB_STD_DEV}'
     rsi_col = f'RSI_{RSI_LENGTH}'
-    vwap_col = 'VWAP'
+    # vwap_col = 'VWAP' # No longer used for stop in this function
 
-    required_cols = [lower_band_col, upper_band_col, middle_band_col, rsi_col, vwap_col, 'close']
-    missing_cols = [col for col in required_cols if col not in df.columns]
-    if missing_cols:
-        print(f"Error: Missing columns for signal generation: {missing_cols}\nAvailable: {df.columns.tolist()}")
+    required_cols = [lower_band_col, upper_band_col, middle_band_col, rsi_col, 'close']
+    missing_cols_check = [col for col in required_cols if col not in df.columns]
+    if missing_cols_check:
+        print(f"Error: Missing columns for signal gen: {missing_cols_check}\nAvailable: {df.columns.tolist()}")
         return signals
 
-    # Buy Conditions
+    # Buy Conditions (same as before)
     cond1_buy_lbb = (df['close'] < df[lower_band_col])
-    cond2_buy_rsi = (df[rsi_col] < RSI_OVERSOLD) # RSI_OVERSOLD is now 35
+    cond2_buy_rsi = (df[rsi_col] < RSI_OVERSOLD)
     buy_condition = cond1_buy_lbb & cond2_buy_rsi
     
-    # Sell Conditions
+    # Sell Conditions (PROFIT TAKES ONLY)
     cond_sell_profit_upperbb = (df['close'] > df[upper_band_col])
     cond_sell_profit_rsi = (df[rsi_col] > RSI_OVERBOUGHT)
     cond_sell_profit_middlebb = (df['close'] > df[middle_band_col])
-    # VWAP stop with buffer
-    cond_sell_stop_vwap = (df['close'] < (df[vwap_col] * (1 - VWAP_STOP_PERCENTAGE_BUFFER)))
+    # cond_sell_stop_vwap = ... # <<< REMOVED VWAP STOP FROM HERE
 
-    # Apply sell signals and reasons with priority
-    # Priority: UpperBB > RSI_OB > VWAP_Stop
-    # A sell reason is set if any of the primary conditions are met.
-    # The 'signal' column is then set to -1 if any sell_reason was populated.
-
-    # 1. Profit Take - Upper Bollinger Band
-    signals.loc[cond_sell_profit_upperbb, 'sell_reason'] = 'UpperBB'
-    # 2. Profit Take - RSI Overbought (only if not already UpperBB)
-    signals.loc[cond_sell_profit_rsi & (signals['sell_reason'] == ''), 'sell_reason'] = 'RSI_OB'
-    # 3. Stop Loss - VWAP (only if not already a profit take)
-    signals.loc[cond_sell_stop_vwap & (signals['sell_reason'] == ''), 'sell_reason'] = 'VWAP_Stop'
-
-    # Refined sell reason logic with MiddleBB PT
-    # Priority: UpperBB > RSI_OB > MiddleBB_PT > VWAP_Stop
+    # Apply profit-take sell signals (priority: UpperBB > RSI_OB > MiddleBB_PT)
     signals.loc[cond_sell_profit_upperbb, 'sell_reason'] = 'UpperBB'
     signals.loc[cond_sell_profit_rsi & (signals['sell_reason'] == ''), 'sell_reason'] = 'RSI_OB'
-    signals.loc[cond_sell_profit_middlebb & (signals['sell_reason'] == ''), 'sell_reason'] = 'MiddleBB_PT' # New
-    signals.loc[cond_sell_stop_vwap & (signals['sell_reason'] == ''), 'sell_reason'] = 'VWAP_Stop'
-
-    signals.loc[signals['sell_reason'] != '', 'signal'] = -1
+    signals.loc[cond_sell_profit_middlebb & (signals['sell_reason'] == ''), 'sell_reason'] = 'MiddleBB_PT'
+    # The ATR stop will be handled in the backtester
     
-    # Set signal to -1 if any sell_reason was populated
-    signals.loc[signals['sell_reason'] != '', 'signal'] = -1
+    # Set signal to -1 if any profit-take reason was populated
+    signals.loc[signals['sell_reason'] != '', 'signal'] = -1 # Mark as a potential sell for backtester
     
-    # Apply buy signals (can override a sell signal on the same bar if logic allows)
-    # This ensures buy takes precedence if rare conditions for both buy and sell are met on the same bar.
+    # Apply buy signals
     signals.loc[buy_condition, 'signal'] = 1
     signals.loc[buy_condition, 'sell_reason'] = '' # Clear sell reason for buy signals
 
     # --- DEBUGGING PRINTS ---
-    print(f"RSI Oversold Threshold: {RSI_OVERSOLD}")
-    print(f"VWAP Stop Buffer: {VWAP_STOP_PERCENTAGE_BUFFER*100}%")
+    print(f"RSI Oversold: {RSI_OVERSOLD}, RSI Overbought: {RSI_OVERBOUGHT}")
+    print(f"ATR Stop Multiplier: {ATR_STOP_MULTIPLIER} (Stop logic in backtester)")
     print(f"Number of potential buy signal points (raw conditions met): {buy_condition.sum()}")
-    print(f"  Breakdown: LBB condition met: {cond1_buy_lbb.sum()}, RSI condition met: {cond2_buy_rsi.sum()}")
+    print(f"  Breakdown: LBB: {cond1_buy_lbb.sum()}, RSI: {cond2_buy_rsi.sum()}")
     
-    print(f"Number of potential sell triggers (UpperBB): {cond_sell_profit_upperbb.sum()}")
-    print(f"Number of potential sell triggers (RSI Overbought): {cond_sell_profit_rsi.sum()}")
-    print(f"Number of potential sell triggers (VWAP Stop with buffer): {cond_sell_stop_vwap.sum()}")
+    print(f"Number of potential PROFIT TAKE triggers (UpperBB): {cond_sell_profit_upperbb.sum()}")
+    print(f"Number of potential PROFIT TAKE triggers (RSI_OB {RSI_OVERBOUGHT}): {cond_sell_profit_rsi.sum()}")
+    print(f"Number of potential PROFIT TAKE triggers (MiddleBB): {cond_sell_profit_middlebb.sum()}")
     
     actual_buy_signals = signals[signals['signal'] == 1]
-    actual_sell_signals = signals[signals['signal'] == -1]
+    # Sell signals here are only profit-take signals from this function's perspective
+    potential_profit_take_signals = signals[signals['sell_reason'] != '']
     print(f"Total BUY signals generated: {len(actual_buy_signals)}")
-    print(f"Total SELL signals generated (based on sell_reason): {len(signals[signals['sell_reason'] != ''])}") # Count actual potential exits
+    print(f"Total PROFIT TAKE signals generated: {len(potential_profit_take_signals)}")
 
     if not actual_buy_signals.empty:
         print("Dates of first 5 BUY signals:")
         print(actual_buy_signals.head().index.strftime('%Y-%m-%d').tolist())
-    if not actual_sell_signals.empty:
-        print("Dates of first 5 SELL signals (and reasons):")
-        print(actual_sell_signals[actual_sell_signals['sell_reason'] != ''].head()[['sell_reason']])
+    if not potential_profit_take_signals.empty:
+        print("Dates of first 5 potential PROFIT TAKE signals (and reasons):")
+        print(potential_profit_take_signals.head()[['sell_reason']])
     
     return signals
 
-# --- 4. Implement Backtester ---
+# --- 4. Implement Backtester with ATR Stop ---
 def backtest_strategy(df_with_indicators, signals_df, initial_capital, position_size_usd):
-    print("\n--- Running Backtest ---")
-    if df_with_indicators.empty or signals_df.empty:
-        print("Cannot backtest with empty data or signals.")
-        return pd.DataFrame(), {}
+    print("\n--- Running Backtest with ATR Stop ---")
+    if df_with_indicators.empty or signals_df.empty: print("Cannot backtest: empty data/signals."); return pd.DataFrame(), {}
     
     capital = initial_capital
     positions_asset_units = 0.0
     portfolio_value_history = []
     trades_log = [] 
     in_position = False
+    
+    current_entry_price = 0.0
+    current_atr_stop_level = 0.0
+    atr_col = f'ATRr_{ATR_PERIOD}' # Ensure this matches the column name from add_indicators
 
     for i in range(len(df_with_indicators)):
         current_date = df_with_indicators.index[i]
         current_price = df_with_indicators['close'].iloc[i]
-        signal_action = signals_df['signal'].iloc[i]
-        sell_reason_for_log = signals_df['sell_reason'].iloc[i] if 'sell_reason' in signals_df.columns else ''
+        current_low_price = df_with_indicators['low'].iloc[i] # Use low for stop check for intra-bar trigger
+        
+        # Get profit-take signal from signals_df (if any)
+        profit_take_signal_action = signals_df['signal'].iloc[i]
+        profit_take_reason = signals_df['sell_reason'].iloc[i]
 
-        if signal_action == 1 and not in_position and capital >= position_size_usd:
-            units_to_buy = position_size_usd / current_price
+        # --- Exit Logic: Check ATR Stop first, then Profit Take Signals ---
+        if in_position:
+            # 1. Check ATR Stop-Loss
+            if current_low_price <= current_atr_stop_level: # Stop triggered if low hits/crosses stop level
+                proceeds_from_sale = positions_asset_units * current_atr_stop_level # Assume exit at stop level
+                capital += proceeds_from_sale
+                trades_log.append({'date': current_date, 'type': 'SELL', 'price': current_atr_stop_level, 
+                                   'units': positions_asset_units, 'cost': pd.NA, 'capital_after': capital, 
+                                   'proceeds': proceeds_from_sale, 'reason': 'ATR_Stop' })
+                positions_asset_units = 0.0; in_position = False; current_entry_price = 0.0; current_atr_stop_level = 0.0
+                # print(f"ATR Stop at {current_date} for price {current_atr_stop_level}")
+
+            # 2. Check Profit-Take Signals (only if not already stopped by ATR)
+            elif profit_take_signal_action == -1 and profit_take_reason != '':
+                proceeds_from_sale = positions_asset_units * current_price # Exit at close for PT
+                capital += proceeds_from_sale
+                trades_log.append({'date': current_date, 'type': 'SELL', 'price': current_price, 
+                                   'units': positions_asset_units, 'cost': pd.NA, 'capital_after': capital, 
+                                   'proceeds': proceeds_from_sale, 'reason': profit_take_reason })
+                positions_asset_units = 0.0; in_position = False; current_entry_price = 0.0; current_atr_stop_level = 0.0
+                # print(f"Profit Take {profit_take_reason} at {current_date} for price {current_price}")
+
+        # --- Entry Logic ---
+        # Check for buy signal (signal_action == 1) only if not currently in a position
+        # and not just exited on the same bar (important if profit_take_signal_action was processed above)
+        if signals_df['signal'].iloc[i] == 1 and not in_position and capital >= position_size_usd:
+            current_entry_price = current_price # Entry at close
+            units_to_buy = position_size_usd / current_entry_price
             positions_asset_units += units_to_buy
             capital -= position_size_usd
             in_position = True
-            trades_log.append({
-                'date': current_date, 'type': 'BUY', 'price': current_price,
-                'units': units_to_buy, 'cost': position_size_usd, 'capital_after': capital,
-                'proceeds': pd.NA, 'reason': '' })
-        elif signal_action == -1 and in_position:
-            proceeds_from_sale = positions_asset_units * current_price
-            capital += proceeds_from_sale
-            trades_log.append({
-                'date': current_date, 'type': 'SELL', 'price': current_price,
-                'units': positions_asset_units, 'cost': pd.NA, 'capital_after': capital,
-                'proceeds': proceeds_from_sale, 'reason': sell_reason_for_log })
-            positions_asset_units = 0.0
-            in_position = False
+            
+            # Set initial ATR stop for this new trade
+            atr_at_entry = df_with_indicators[atr_col].iloc[i]
+            current_atr_stop_level = current_entry_price - (ATR_STOP_MULTIPLIER * atr_at_entry)
+            # print(f"BUY at {current_date}, Entry: {current_entry_price:.4f}, ATR: {atr_at_entry:.4f}, Initial ATR Stop: {current_atr_stop_level:.4f}")
+
+            trades_log.append({'date': current_date, 'type': 'BUY', 'price': current_entry_price, 
+                               'units': units_to_buy, 'cost': position_size_usd, 'capital_after': capital, 
+                               'proceeds': pd.NA, 'reason': '' })
         
         current_portfolio_value = capital + (positions_asset_units * current_price)
         portfolio_value_history.append(current_portfolio_value)
 
+    # --- Prepare Results ---
+    # (Same as before)
     portfolio_df = pd.DataFrame({'value': portfolio_value_history}, index=df_with_indicators.index)
-    final_portfolio_value = portfolio_df['value'].iloc[-1] if not portfolio_df.empty else initial_capital
-    total_return_abs = final_portfolio_value - initial_capital
-    total_return_pct = (total_return_abs / initial_capital) * 100 if initial_capital > 0 else 0
-    num_trades_executed = len([t for t in trades_log if t['type'] == 'BUY'])
-
-    results = {
-        'initial_capital': initial_capital, 'final_portfolio_value': final_portfolio_value,
-        'total_return_usd': total_return_abs, 'total_return_pct': total_return_pct,
-        'num_trades': num_trades_executed,
-        'trades_log_df': pd.DataFrame(trades_log, columns=['date', 'type', 'price', 'units', 'cost', 'capital_after', 'proceeds', 'reason'])
-    }
+    final_val = portfolio_df['value'].iloc[-1] if not portfolio_df.empty else initial_capital; ret_abs = final_val - initial_capital
+    ret_pct = (ret_abs / initial_capital) * 100 if initial_capital > 0 else 0; num_trades = len([t for t in trades_log if t['type'] == 'BUY'])
+    results = {'initial_capital': initial_capital, 'final_portfolio_value': final_val, 'total_return_usd': ret_abs, 'total_return_pct': ret_pct, 'num_trades': num_trades, 'trades_log_df': pd.DataFrame(trades_log, columns=['date', 'type', 'price', 'units', 'cost', 'capital_after', 'proceeds', 'reason'])}
     return portfolio_df, results
 
 # --- 5. Run and Analyze ---
 if __name__ == "__main__":
     print(f"Starting trading strategy backtest for {SYMBOL}")
     print(f"Period: {START_DATE_STR} to {END_DATE_STR}")
-    print(f"Parameters: BB({BB_LENGTH},{BB_STD_DEV}), RSI({RSI_LENGTH}, OB:{RSI_OVERBOUGHT}, OS:{RSI_OVERSOLD}), VWAP_Stop_Buffer: {VWAP_STOP_PERCENTAGE_BUFFER*100}%")
+    print(f"Parameters: BB({BB_LENGTH},{BB_STD_DEV}), RSI({RSI_LENGTH}, OB:{RSI_OVERBOUGHT}, OS:{RSI_OVERSOLD}), ATR_Stop({ATR_PERIOD}, Multiplier:{ATR_STOP_MULTIPLIER})")
     print("---" * 10)
 
     data_df_raw = get_historical_data(SYMBOL, TIMEFRAME, START_DATE_STR, END_DATE_STR)
 
     if not data_df_raw.empty:
-        print("\n--- Raw Data Sample (head) ---")
-        print(data_df_raw.head())
-        
         data_with_indicators = add_indicators(data_df_raw.copy())
         
         if not data_with_indicators.empty:
-            print("\n--- DETAILED DATA RANGE CHECK ---") # Added diagnostic
-            print(f"data_df_raw (fetched) START: {data_df_raw.index.min()}, END: {data_df_raw.index.max()}, COUNT: {len(data_df_raw)}")
-            print(f"data_with_indicators (after ind & dropna) START: {data_with_indicators.index.min()}, END: {data_with_indicators.index.max()}, COUNT: {len(data_with_indicators)}")
+            print("\n--- Data with Indicators (ATR tail sample) ---")
+            atr_col_name_for_print = f'ATRr_{ATR_PERIOD}'
+            if atr_col_name_for_print in data_with_indicators.columns:
+                 print(data_with_indicators[['close', atr_col_name_for_print]].tail())
+            else:
+                print(f"'{atr_col_name_for_print}' not found in columns for tail print.")
             
-            print("\n--- Data with Indicators (tail sample) ---")
-            print(data_with_indicators.tail())
-            
-            trading_signals_df = generate_signals(data_with_indicators)
+            trading_signals_df = generate_signals(data_with_indicators) # Generates Buys & Profit-Take Sells
             portfolio_history_df, backtest_summary = backtest_strategy(
                 data_with_indicators, trading_signals_df, INITIAL_CAPITAL, POSITION_SIZE_USD
             )
 
             print("\n--- Backtest Results ---")
+            # (Print statements for results and trades log are same as before)
             print(f"Initial Capital: ${backtest_summary['initial_capital']:.2f}")
             print(f"Final Portfolio Value: ${backtest_summary['final_portfolio_value']:.2f}")
             print(f"Total Return: ${backtest_summary['total_return_usd']:.2f} ({backtest_summary['total_return_pct']:.2f}%)")
@@ -291,23 +291,21 @@ if __name__ == "__main__":
             else: print("No trades were executed.")
 
             if backtest_summary['num_trades'] < 5 and (datetime.strptime(END_DATE_STR, '%Y-%m-%d') - datetime.strptime(START_DATE_STR, '%Y-%m-%d')).days > 180 :
-                print("\nWARNING: Relatively few trades for the backtest period. Consider further parameter tuning or strategy adjustments.")
+                print("\nWARNING: Relatively few trades. Consider parameter tuning.")
 
+            # (Plotting code is same as before)
             if not portfolio_history_df.empty:
                 try:
-                    plt.figure(figsize=(14, 7))
-                    plt.plot(portfolio_history_df.index, portfolio_history_df['value'], label='Strategy Equity')
-                    buy_dates = trades_df[trades_df['type'] == 'BUY']['date']
-                    sell_dates = trades_df[trades_df['type'] == 'SELL']['date']
+                    plt.figure(figsize=(14, 7)); plt.plot(portfolio_history_df.index, portfolio_history_df['value'], label='Strategy Equity', alpha=0.7)
+                    buy_dates = trades_df[trades_df['type'] == 'BUY']['date']; sell_dates = trades_df[trades_df['type'] == 'SELL']['date']
+                    if not portfolio_history_df.index.is_monotonic_increasing: portfolio_history_df = portfolio_history_df.sort_index()
                     buy_values = portfolio_history_df.loc[portfolio_history_df.index.intersection(buy_dates)]['value']
                     sell_values = portfolio_history_df.loc[portfolio_history_df.index.intersection(sell_dates)]['value']
                     plt.plot(buy_values.index, buy_values, '^', markersize=10, color='g', lw=0, label='Buy Signal')
                     plt.plot(sell_values.index, sell_values, 'v', markersize=10, color='r', lw=0, label='Sell Signal')
-                    plt.title(f'{SYMBOL} Strategy Equity Curve ({START_DATE_STR} to {END_DATE_STR})')
-                    plt.ylabel('Portfolio Value (USD)'); plt.xlabel('Date')
-                    plt.legend(); plt.grid(True); plt.tight_layout(); plt.show()
+                    plt.title(f'{SYMBOL} Strat Equity ({START_DATE_STR} to {END_DATE_STR}) - ATR Stop ({ATR_STOP_MULTIPLIER}x)'); plt.ylabel('Portfolio Value (USD)'); plt.xlabel('Date'); plt.legend(); plt.grid(True); plt.tight_layout(); plt.show()
                 except Exception as e: print(f"\nError during plotting: {e}")
-            else: print("\nPortfolio history is empty, cannot plot.")
-        else: print("Could not generate indicators or data became empty. Aborting backtest.")
-    else: print("No data fetched. Aborting backtest.")
+            else: print("\nPortfolio history empty, cannot plot.")
+        else: print("Could not generate indicators. Aborting.")
+    else: print("No data fetched. Aborting.")
     print("\n--- Script Finished ---")
