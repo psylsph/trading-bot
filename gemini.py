@@ -24,7 +24,7 @@ TIMEFRAME = tradeapi.TimeFrame.Day
 # Use a specific period for consistent testing, e.g., your out-of-sample period or best full period
 # For this example, let's use the Jan 2025 - May 2025 out-of-sample period you showed good results on
 # Or adjust to your longer preferred testing period
-START_DATE_STR = (date.today() - timedelta(days=365)).strftime('%Y-%m-%d') # Example: Out-of-sample
+START_DATE_STR = (date.today() - timedelta(days=150)).strftime('%Y-%m-%d') # Example: Out-of-sample
 END_DATE_STR = (date.today() - timedelta(days=1)).strftime('%Y-%m-%d') # Use yesterday as end for fresh runs
 # Or, for reproducing exact results from a specific test:
 # END_DATE_STR = '2025-05-18' # If that was your last successful test end date
